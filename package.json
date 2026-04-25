@@ -1,5 +1,5 @@
 {
-  "name": "internetsearch",
+  "name": "@nachoretro/internetsearch",
   "version": "1.0.0",
   "description": "Enhanced web search and content extraction MCP - search engines, RSS, YouTube transcripts, metadata extraction",
   "type": "module",

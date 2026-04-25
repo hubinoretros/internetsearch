@@ -19,12 +19,12 @@ An evolution of mcp-server-fetch with significantly more capabilities.
 ## Installation
 
 ```bash
-npm install -g internetsearch
+npm install -g @nachoretro/internetsearch
 ```
 
 Or use npx (no install):
 ```bash
-npx internetsearch
+npx @nachoretro/internetsearch
 ```
 
 ## Configuration
@@ -38,7 +38,7 @@ Add to your `claude_desktop_config.json`:
   "mcpServers": {
     "internetsearch": {
       "command": "npx",
-      "args": ["-y", "internetsearch"],
+      "args": ["-y", "@nachoretro/internetsearch"],
       "env": {
         "BRAVE_API_KEY": "optional-brave-api-key-for-better-search"
       }
