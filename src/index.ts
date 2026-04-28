@@ -132,7 +132,39 @@ async function checkRobotsTxt(url: string, userAgent: string): Promise<{ allowed
   }
 }
 
-// Search engines - improved with HTML scraping fallback
+async function searchGoogleCustom(query: string, maxResults: number): Promise<SearchResult[]> {
+  const apiKey = process.env.GOOGLE_API_KEY;
+  const cx = process.env.GOOGLE_CX;
+  
+  if (!apiKey || !cx) return [];
+  
+  try {
+    const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${cx}&q=${encodeURIComponent(query)}&num=${maxResults}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const response = await fetch(url, {
+      headers: { "User-Agent": config.userAgent },
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) throw new Error(`Google API error: ${response.status}`);
+    
+    const data = await response.json() as any;
+    return (data.items || []).map((item: any) => ({
+      title: item.title,
+      url: item.link,
+      snippet: item.snippet || "",
+      source: "Google Custom Search"
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// Search engines - multiple fallback strategies
 async function searchDuckDuckGo(query: string, maxResults: number): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
   
@@ -161,7 +193,7 @@ async function searchDuckDuckGo(query: string, maxResults: number): Promise<Sear
             title: item.title,
             url: item.url,
             snippet: item.abstract,
-            source: "DuckDuckGo"
+            source: "DuckDuckGo (ddgr)"
           });
         } catch {
           // Skip malformed JSON lines
@@ -171,59 +203,128 @@ async function searchDuckDuckGo(query: string, maxResults: number): Promise<Sear
     
     if (results.length > 0) return results;
   } catch (ddgrError) {
-    // ddgr not available or failed, try HTML scraping
+    // ddgr not available or failed
   }
   
-  // Try 2: HTML scraping from DuckDuckGo Lite (no JS required)
+  // Try 2: DuckDuckGo Instant Answer API (official, no auth needed)
   try {
-    const searchUrl = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+    const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
     
-    const response = await fetch(searchUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
+    const response = await fetch(apiUrl, {
+      headers: { "User-Agent": config.userAgent },
       signal: controller.signal,
     });
     
     clearTimeout(timeoutId);
     
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    
-    const html = await response.text();
-    const $ = cheerio.load(html);
-    
-    // Parse DuckDuckGo Lite results
-    $("table.result").each((i, el) => {
-      if (i >= maxResults) return false;
+    if (response.ok) {
+      const data = await response.json() as any;
       
-      const $el = $(el);
-      const titleLink = $el.find("a.result-link").first();
-      const title = titleLink.text().trim();
-      const url = titleLink.attr("href");
-      const snippet = $el.find("td.result-snippet").text().trim();
-      
-      if (title && url) {
+      // Abstract (direct answer)
+      if (data.Abstract && data.AbstractURL) {
         results.push({
-          title,
-          url: url.startsWith("http") ? url : `https:${url}`,
-          snippet: snippet || "No description available",
-          source: "DuckDuckGo Lite"
+          title: data.AbstractTitle || data.Heading || "DuckDuckGo Answer",
+          url: data.AbstractURL,
+          snippet: data.Abstract,
+          source: "DuckDuckGo Instant Answer"
         });
       }
-    });
+      
+      // Related topics
+      if (data.RelatedTopics) {
+        for (const topic of data.RelatedTopics.slice(0, maxResults - results.length)) {
+          if (topic.Text && topic.FirstURL) {
+            results.push({
+              title: topic.Text.substring(0, 80),
+              url: topic.FirstURL,
+              snippet: topic.Text,
+              source: "DuckDuckGo Related"
+            });
+          } else if (topic.Topics) {
+            for (const subtopic of topic.Topics.slice(0, 3)) {
+              if (subtopic.Text && subtopic.FirstURL) {
+                results.push({
+                  title: subtopic.Text.substring(0, 80),
+                  url: subtopic.FirstURL,
+                  snippet: subtopic.Text,
+                  source: "DuckDuckGo Related"
+                });
+              }
+            }
+          }
+          if (results.length >= maxResults) break;
+        }
+      }
+      
+      // Results (if available)
+      if (data.Results) {
+        for (const result of data.Results.slice(0, maxResults - results.length)) {
+          if (result.Text && result.FirstURL) {
+            results.push({
+              title: result.Text.substring(0, 80),
+              url: result.FirstURL,
+              snippet: result.Text,
+              source: "DuckDuckGo Result"
+            });
+          }
+        }
+      }
+    }
     
     if (results.length > 0) return results;
-  } catch (htmlError) {
-    // HTML scraping failed
+  } catch (apiError) {
+    // DDG API failed
   }
   
-  // If both methods failed, return empty with helpful message
+  // Try 3: SearXNG public instances
+  const searxInstances = [
+    "https://search.sapti.me",
+    "https://searx.be",
+    "https://search.bus-hit.me",
+  ];
+  
+  for (const instance of searxInstances) {
+    try {
+      const searchUrl = `${instance}/search?q=${encodeURIComponent(query)}&format=json&categories=general`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      
+      const response = await fetch(searchUrl, {
+        headers: {
+          "User-Agent": config.userAgent,
+          "Accept": "application/json",
+        },
+        signal: controller.signal,
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (response.ok) {
+        const data = await response.json() as any;
+        
+        if (data.results && data.results.length > 0) {
+          for (const r of data.results.slice(0, maxResults)) {
+            results.push({
+              title: r.title || "Untitled",
+              url: r.url,
+              snippet: r.content || r.description || "No description",
+              source: `SearXNG (${new URL(instance).hostname})`
+            });
+          }
+          if (results.length > 0) return results;
+        }
+      }
+    } catch {
+      // Try next instance
+      continue;
+    }
+  }
+  
+  // All methods failed
   if (results.length === 0) {
-    console.error("Note: For DuckDuckGo search, install ddgr (pip install ddgr) or use BRAVE_API_KEY");
+    console.error("Search note: For better web search, install ddgr (pip install ddgr) or set BRAVE_API_KEY environment variable.");
   }
   
   return results;
@@ -785,8 +886,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         
         let results: SearchResult[] = [];
         
+        // Try engines in priority order
         if (engine === "brave" && process.env.BRAVE_API_KEY) {
           results = await searchBrave(query, process.env.BRAVE_API_KEY, maxResults);
+        }
+        
+        if (results.length === 0) {
+          results = await searchGoogleCustom(query, maxResults);
         }
         
         if (results.length === 0) {
@@ -797,12 +903,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{ 
               type: "text", 
-              text: `No results found for "${query}". Note: For better results, install ddgr or set BRAVE_API_KEY environment variable.` 
+              text: `No web search results found for "${query}".\n\nTo enable full web search, configure one of the following:\n\n1. Brave Search API (recommended):\n   Set BRAVE_API_KEY environment variable\n   Get key at: https://brave.com/search/api\n\n2. Google Custom Search:\n   Set GOOGLE_API_KEY and GOOGLE_CX environment variables\n\n3. DuckDuckGo CLI:\n   Install ddgr (pip install ddgr)\n\nNote: Basic DuckDuckGo search only returns results for specific topics.\nFor general queries, a search API key is required.`
             }],
           };
         }
         
-        const lines = [`Search results for "${query}" (${results.length} results):\n`];
+        const lines = [`Web search results for "${query}" (${results.length} results):\n`];
         results.forEach((r, i) => {
           lines.push(`${i + 1}. ${r.title}`);
           lines.push(`   URL: ${r.url}`);
