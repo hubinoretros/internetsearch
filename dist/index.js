@@ -590,7 +590,7 @@ const tools = [
     },
     {
         name: "youtube_transcript",
-        description: "Extract transcript from a YouTube video (requires yt-dlp)",
+        description: "Extract transcript from a YouTube video (requires yt-dlp). Provide either video_id OR url.",
         inputSchema: {
             type: "object",
             properties: {
@@ -600,10 +600,9 @@ const tools = [
                 },
                 url: {
                     type: "string",
-                    description: "Full YouTube URL (alternative to video_id)",
+                    description: "Full YouTube URL (e.g., 'https://youtube.com/watch?v=...')",
                 },
             },
-            oneOf: [{ required: ["video_id"] }, { required: ["url"] }],
         },
     },
     {
@@ -778,6 +777,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case "youtube_transcript": {
                 let videoId = safeArgs.video_id;
                 const url = safeArgs.url;
+                // Validation: must provide at least one
+                if (!videoId && !url) {
+                    return {
+                        content: [{
+                                type: "text",
+                                text: "Error: Must provide either 'video_id' or 'url' parameter.\n\nExamples:\n  {\"video_id\": \"dQw4w9WgXcQ\"}\n  {\"url\": \"https://youtube.com/watch?v=dQw4w9WgXcQ\"}"
+                            }],
+                        isError: true,
+                    };
+                }
                 if (!videoId && url) {
                     const match = url.match(/(?:v=|\/)([\w-]{11})/);
                     videoId = match?.[1];
