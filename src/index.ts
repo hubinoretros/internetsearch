@@ -18,6 +18,24 @@ import * as cheerio from "cheerio";
 
 // User agents
 const DEFAULT_USER_AGENT = "InternetSearch-MCP/1.0 (+https://github.com/hubinoretros/internetsearch)";
+const DEFAULT_USER_AGENT_MANUAL = "InternetSearch-MCP/1.0 (User-Specified; +https://github.com/hubinoretros/internetsearch)";
+
+// Configuration
+interface Config {
+  userAgent: string;
+  userAgentManual: string;
+  ignoreRobotsTxt: boolean;
+  proxyUrl?: string;
+  timeout: number;
+}
+
+const config: Config = {
+  userAgent: process.env.USER_AGENT || DEFAULT_USER_AGENT,
+  userAgentManual: process.env.USER_AGENT || DEFAULT_USER_AGENT_MANUAL,
+  ignoreRobotsTxt: process.env.IGNORE_ROBOTS_TXT === "true",
+  proxyUrl: process.env.PROXY_URL,
+  timeout: parseInt(process.env.TIMEOUT || "30", 10),
+};
 
 // Interfaces
 interface SearchResult {
@@ -48,12 +66,78 @@ interface RSSItem {
   pubDate: string;
 }
 
-// Search engines
+// Robots.txt checker - respects website crawling policies
+async function checkRobotsTxt(url: string, userAgent: string): Promise<{ allowed: boolean; message?: string }> {
+  if (config.ignoreRobotsTxt) {
+    return { allowed: true };
+  }
+  
+  try {
+    const parsed = new URL(url);
+    const robotsUrl = `${parsed.protocol}//${parsed.host}/robots.txt`;
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    
+    const response = await fetch(robotsUrl, {
+      headers: { "User-Agent": userAgent },
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (response.status === 404) {
+      return { allowed: true }; // No robots.txt = allowed
+    }
+    
+    if (!response.ok) {
+      return { allowed: true, message: `Could not check robots.txt (HTTP ${response.status})` };
+    }
+    
+    const robotsTxt = await response.text();
+    const userAgentPattern = new RegExp(`User-agent:\s*([^\\n]+)\\n`, "gi");
+    const disallowPattern = /Disallow:\s*(.+)/gi;
+    
+    let isAllowed = true;
+    let currentUserAgent = "*";
+    
+    const lines = robotsTxt.split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      
+      if (trimmed.toLowerCase().startsWith("user-agent:")) {
+        currentUserAgent = trimmed.split(":")[1]?.trim() || "*";
+      } else if (trimmed.toLowerCase().startsWith("disallow:")) {
+        const path = trimmed.split(":")[1]?.trim();
+        if (path && (currentUserAgent === "*" || userAgent.includes(currentUserAgent))) {
+          const urlPath = parsed.pathname + parsed.search;
+          if (urlPath.startsWith(path)) {
+            isAllowed = false;
+          }
+        }
+      }
+    }
+    
+    if (!isAllowed) {
+      return {
+        allowed: false,
+        message: `Fetching blocked by robots.txt. Path "${parsed.pathname}" is disallowed. Set IGNORE_ROBOTS_TXT=true to override (use responsibly).`
+      };
+    }
+    
+    return { allowed: true };
+  } catch (error) {
+    // If we can't check robots.txt, allow but warn
+    return { allowed: true, message: `Could not verify robots.txt: ${error instanceof Error ? error.message : "Unknown error"}` };
+  }
+}
+
+// Search engines - improved with HTML scraping fallback
 async function searchDuckDuckGo(query: string, maxResults: number): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
   
+  // Try 1: Use ddgr if available
   try {
-    // Use ddgr or duckduckgo-search Python package via subprocess
     const ddgr = spawn("ddgr", ["--json", "-n", maxResults.toString(), query]);
     
     let output = "";
@@ -64,8 +148,8 @@ async function searchDuckDuckGo(query: string, maxResults: number): Promise<Sear
         if (code === 0 || output.length > 0) resolve(null);
         else reject(new Error("ddgr failed"));
       });
-      ddgr.on("error", reject);
-      setTimeout(() => { ddgr.kill(); resolve(null); }, 10000);
+      ddgr.on("error", () => reject(new Error("ddgr not installed")));
+      setTimeout(() => { ddgr.kill(); reject(new Error("ddgr timeout")); }, 10000);
     });
     
     if (output) {
@@ -79,11 +163,67 @@ async function searchDuckDuckGo(query: string, maxResults: number): Promise<Sear
             snippet: item.abstract,
             source: "DuckDuckGo"
           });
-        } catch {}
+        } catch {
+          // Skip malformed JSON lines
+        }
       }
     }
-  } catch {
-    // Fallback: simulate search with brave search API if available
+    
+    if (results.length > 0) return results;
+  } catch (ddgrError) {
+    // ddgr not available or failed, try HTML scraping
+  }
+  
+  // Try 2: HTML scraping from DuckDuckGo Lite (no JS required)
+  try {
+    const searchUrl = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    
+    const response = await fetch(searchUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    
+    const html = await response.text();
+    const $ = cheerio.load(html);
+    
+    // Parse DuckDuckGo Lite results
+    $("table.result").each((i, el) => {
+      if (i >= maxResults) return false;
+      
+      const $el = $(el);
+      const titleLink = $el.find("a.result-link").first();
+      const title = titleLink.text().trim();
+      const url = titleLink.attr("href");
+      const snippet = $el.find("td.result-snippet").text().trim();
+      
+      if (title && url) {
+        results.push({
+          title,
+          url: url.startsWith("http") ? url : `https:${url}`,
+          snippet: snippet || "No description available",
+          source: "DuckDuckGo Lite"
+        });
+      }
+    });
+    
+    if (results.length > 0) return results;
+  } catch (htmlError) {
+    // HTML scraping failed
+  }
+  
+  // If both methods failed, return empty with helpful message
+  if (results.length === 0) {
+    console.error("Note: For DuckDuckGo search, install ddgr (pip install ddgr) or use BRAVE_API_KEY");
   }
   
   return results;
@@ -116,30 +256,47 @@ async function searchBrave(query: string, apiKey: string, maxResults: number): P
   }
 }
 
-// Content extraction
+// Content extraction with robots.txt respect and proxy support
 async function fetchUrl(
   url: string, 
   options: {
     raw?: boolean;
     timeout?: number;
     extractLinks?: boolean;
+    checkRobots?: boolean;
+    isManualFetch?: boolean;
   } = {}
 ): Promise<PageContent> {
+  // Check robots.txt unless disabled or it's a manual fetch
+  if (options.checkRobots !== false && !options.isManualFetch) {
+    const robotsCheck = await checkRobotsTxt(url, config.userAgent);
+    if (!robotsCheck.allowed) {
+      throw new Error(robotsCheck.message || "Fetching blocked by robots.txt");
+    }
+  }
+  
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), (options.timeout || 30) * 1000);
+  const timeoutId = setTimeout(() => controller.abort(), (options.timeout || config.timeout) * 1000);
+  
+  // Use appropriate user agent
+  const userAgent = options.isManualFetch ? config.userAgentManual : config.userAgent;
   
   try {
-    const response = await fetch(url, {
+    // Support proxy if configured
+    const fetchOptions: RequestInit = {
       headers: {
-        "User-Agent": DEFAULT_USER_AGENT,
+        "User-Agent": userAgent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
         "DNT": "1",
         "Connection": "keep-alive",
       },
       signal: controller.signal,
-    });
+    };
+    
+    // Note: Node.js 18+ native fetch doesn't support proxy directly
+    // For proxy support, users should use global-agent or similar
+    const response = await fetch(url, fetchOptions);
     
     clearTimeout(timeoutId);
     
@@ -266,64 +423,168 @@ async function parseRSS(url: string): Promise<RSSItem[]> {
   }
 }
 
-// YouTube transcript extraction (simulated - requires yt-dlp or similar)
+// YouTube transcript extraction using yt-dlp
 async function getYouTubeTranscript(videoId: string): Promise<string> {
+  // Check if yt-dlp is available first
+  const checkYtdlp = spawn("which", ["yt-dlp"]);
+  let ytdlpAvailable = false;
+  
+  await new Promise((resolve) => {
+    checkYtdlp.on("close", (code) => {
+      ytdlpAvailable = code === 0;
+      resolve(null);
+    });
+    checkYtdlp.on("error", () => resolve(null));
+    setTimeout(() => resolve(null), 2000);
+  });
+  
+  if (!ytdlpAvailable) {
+    throw new Error(
+      "yt-dlp is not installed.\n\n" +
+      "To extract YouTube transcripts, install yt-dlp:\n" +
+      "  pip install yt-dlp\n\n" +
+      "Or download from: https://github.com/yt-dlp/yt-dlp\n\n" +
+      "Note: YouTube transcript extraction requires external tools due to YouTube's restrictions."
+    );
+  }
+  
   return new Promise((resolve, reject) => {
-    const ytdlp = spawn("yt-dlp", ["--skip-download", "--print", "transcript", `https://youtube.com/watch?v=${videoId}`]);
+    // Try multiple methods for transcript extraction
+    const methods = [
+      // Method 1: Get automatic captions
+      ["yt-dlp", "--skip-download", "--write-auto-sub", "--sub-langs", "en", "--output", "-", `https://youtube.com/watch?v=${videoId}`],
+      // Method 2: Get manual subtitles
+      ["yt-dlp", "--skip-download", "--write-sub", "--sub-langs", "en", "--output", "-", `https://youtube.com/watch?v=${videoId}`],
+    ];
     
-    let output = "";
-    let error = "";
+    let methodIndex = 0;
     
-    ytdlp.stdout.on("data", (data) => { output += data; });
-    ytdlp.stderr.on("data", (data) => { error += data; });
-    
-    ytdlp.on("close", (code) => {
-      if (code === 0 && output) {
-        resolve(output);
-      } else {
-        reject(new Error(error || "Failed to extract transcript"));
+    function tryNextMethod() {
+      if (methodIndex >= methods.length) {
+        reject(new Error(
+          "Could not extract transcript. Possible reasons:\n" +
+          "  - Video has no captions/subtitles\n" +
+          "  - Video is age-restricted or private\n" +
+          "  - yt-dlp version is outdated (try: pip install -U yt-dlp)\n\n" +
+          "You can try manually fetching the video page with fetch_page tool."
+        ));
+        return;
       }
-    });
+      
+      const args = methods[methodIndex];
+      methodIndex++;
+      
+      const ytdlp = spawn(args[0], args.slice(1));
+      let output = "";
+      let errorOutput = "";
+      
+      ytdlp.stdout.on("data", (data) => { output += data.toString(); });
+      ytdlp.stderr.on("data", (data) => { errorOutput += data.toString(); });
+      
+      ytdlp.on("close", (code) => {
+        if (code === 0 && output.length > 100) {
+          // Clean up the output (remove timing info, format as plain text)
+          const cleaned = output
+            .replace(/\[.*?\]/g, "") // Remove [00:00:00.000] style timestamps
+            .replace(/\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}/g, "") // Remove WEBVTT timestamps
+            .replace(/WEBVTT/g, "")
+            .replace(/NOTE.*\n/g, "")
+            .replace(/\n\s*\n/g, "\n") // Remove empty lines
+            .trim();
+          resolve(cleaned);
+        } else {
+          tryNextMethod();
+        }
+      });
+      
+      ytdlp.on("error", () => tryNextMethod());
+      
+      setTimeout(() => {
+        ytdlp.kill();
+        tryNextMethod();
+      }, 20000);
+    }
     
-    ytdlp.on("error", () => {
-      reject(new Error("yt-dlp not installed"));
-    });
-    
-    setTimeout(() => {
-      ytdlp.kill();
-      reject(new Error("Timeout"));
-    }, 30000);
+    tryNextMethod();
   });
 }
 
-// Content summarization (simple implementation)
+// Improved content summarization using TF-IDF-like scoring
 function summarizeContent(text: string, maxSentences: number = 3): string {
-  // Split into sentences
-  const sentences: string[] = text.match(/[^.!?]+[.!?]+/g) || [];
+  if (!text || text.length < 200) return text; // Too short to summarize
   
-  // Score sentences by keyword frequency
+  // Split into sentences (improved regex to handle abbreviations better)
+  const sentences: string[] = text
+    .replace(/([.!?])\s+(?=[A-Z])/g, "$1\n")
+    .split("\n")
+    .map(s => s.trim())
+    .filter(s => s.length > 20 && s.length < 500); // Filter too short/long
+  
+  if (sentences.length <= maxSentences) return text;
+  
+  // Build word frequency (TF-like)
   const wordFreq: Map<string, number> = new Map();
-  const words = text.toLowerCase().match(/\b\w+\b/g) || [];
+  const stopWords = new Set(["the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her", "was", "one", "our", "out", "day", "get", "has", "him", "his", "how", "its", "may", "new", "now", "old", "see", "two", "who", "boy", "did", "she", "use", "her", "way", "many", "oil", "sit", "set", "run", "eat", "far", "sea", "eye", "ask", "own", "say", "too", "any", "try", "let", "put", "say", "she", "try", "way", "own", "say", "too", "old", "tell", "very", "when", "come", "there", "each", "which", "their", "time", "will", "about", "if", "up", "out", "many", "then", "them", "these", "so", "some", "what", "would", "make", "like", "into", "him", "has", "two", "more", "go", "no", "way", "could", "my", "than", "first", "been", "call", "who", "its", "now", "find", "long", "down", "day", "did", "get", "come", "made", "may", "part"]);
   
-  for (const word of words) {
-    if (word.length > 3) {
-      wordFreq.set(word, (wordFreq.get(word) || 0) + 1);
-    }
-  }
+  // Calculate document frequency (how many sentences contain each word)
+  const docFreq: Map<string, number> = new Map();
   
-  const scored = sentences.map((sentence, index) => {
-    const sentenceWords = sentence.toLowerCase().match(/\b\w+\b/g) || [];
-    const score = sentenceWords.reduce((sum, word) => sum + (wordFreq.get(word) || 0), 0);
-    return { sentence: sentence.trim(), score, originalIndex: index };
+  sentences.forEach(sentence => {
+    const words = sentence.toLowerCase().match(/\b[a-z]+\b/g) || [];
+    const uniqueWords = new Set(words);
+    uniqueWords.forEach(word => {
+      if (!stopWords.has(word) && word.length > 3) {
+        docFreq.set(word, (docFreq.get(word) || 0) + 1);
+      }
+    });
   });
   
-  scored.sort((a, b) => b.score - a.score);
+  // Score sentences using TF-IDF-like weighting
+  const scored = sentences.map((sentence, index) => {
+    const words = sentence.toLowerCase().match(/\b[a-z]+\b/g) || [];
+    const wordCount = new Map<string, number>();
+    
+    words.forEach(word => {
+      if (!stopWords.has(word) && word.length > 3) {
+        wordCount.set(word, (wordCount.get(word) || 0) + 1);
+      }
+    });
+    
+    // Calculate TF-IDF score
+    let score = 0;
+    let wordCountTotal = 0;
+    
+    wordCount.forEach((count, word) => {
+      const tf = count / words.length;
+      const idf = Math.log(sentences.length / (docFreq.get(word) || 1));
+      score += tf * idf;
+      wordCountTotal += count;
+    });
+    
+    // Bonus for first and last sentences (often contain key info)
+    if (index === 0) score *= 1.5;
+    if (index === sentences.length - 1) score *= 1.3;
+    
+    return { 
+      sentence: sentence.trim(), 
+      score, 
+      originalIndex: index,
+      wordCount: wordCountTotal
+    };
+  });
   
-  return scored
-    .slice(0, maxSentences)
-    .sort((a, b) => a.originalIndex - b.originalIndex)
-    .map(s => s.sentence)
-    .join(" ");
+  // Filter out sentences with too few content words
+  const filtered = scored.filter(s => s.wordCount >= 3);
+  if (filtered.length === 0) return text.substring(0, 500) + "...";
+  
+  // Sort by score and pick top N
+  filtered.sort((a, b) => b.score - a.score);
+  const topSentences = filtered.slice(0, maxSentences);
+  
+  // Sort back by original position for coherent reading
+  topSentences.sort((a, b) => a.originalIndex - b.originalIndex);
+  
+  return topSentences.map(s => s.sentence).join(" ");
 }
 
 // MCP Server setup
